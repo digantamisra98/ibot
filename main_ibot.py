@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
+import wandb
 
 from pathlib import Path
 from PIL import Image
@@ -92,6 +93,20 @@ def get_args_parser():
         `--teacher_temp`""")
     parser.add_argument('--warmup_teacher_temp_epochs', default=30, type=int,
         help='Number of warmup epochs for the teacher temperature (Default: 30).')
+    
+    # Shrink and Perturb Arguments
+    parser.add_argument('--shrink_coeff', default=0.4, type=float, help="Shrink factor for S&P")
+    parser.add_argument('--perturb_coeff', default=0.1, type=float, help="Perturb probability for S&P")
+    parser.add_argument('--sp_freq', default=8, type=int, help='Frequency of S&P during training')
+
+    # WandB args
+    parser.add_argument("--wandb", action="store_true", help="Use wandb for logging")
+    parser.add_argument("--wandb-project", type=str, default="iBOT_SP")
+    parser.add_argument("--wandb-entity", type=str, default="landskape")
+    parser.add_argument("--wandb-name", type=str, default="iBOT_SP")
+    parser.add_argument(
+        "--log_grad", action="store_true", help="Log gradients for models on WandB"
+    )
 
     # Training/Optimization parameters
     parser.add_argument('--use_fp16', type=utils.bool_flag, default=True, help="""Whether or not
@@ -150,7 +165,13 @@ def get_args_parser():
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     return parser
 
-def train_ibot(args):
+def shrink_perturb(args, student, teacher):
+    with torch.no_grad():  # momentum parameter
+        for param_q, param_k in zip(student.module.parameters(), teacher.module.parameters()):
+            param_k.data.mul_(args.shrink_coeff).add_(args.perturb_coeff * param_q.detach().data)
+            param_q.data = param_k.data
+
+def train_ibot(args, wandb_logger=None):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
@@ -305,17 +326,17 @@ def train_ibot(args):
     lr_schedule = utils.cosine_scheduler(
         args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256.,  # linear scaling rule
         args.min_lr,
-        args.epochs, len(data_loader),
+        (args.epochs//args.sp_freq), len(data_loader),
         warmup_epochs=args.warmup_epochs,
     )
     wd_schedule = utils.cosine_scheduler(
         args.weight_decay,
         args.weight_decay_end,
-        args.epochs, len(data_loader),
+        (args.epochs//args.sp_freq), len(data_loader),
     )
     # momentum parameter is increased to 1. during training with a cosine schedule
     momentum_schedule = utils.cosine_scheduler(args.momentum_teacher, 1,
-                                            args.epochs, len(data_loader))
+                                            (args.epochs//args.sp_freq), len(data_loader))
                   
     print(f"Loss, optimizer and schedulers ready.")
 
@@ -335,14 +356,35 @@ def train_ibot(args):
 
     start_time = time.time()
     print("Starting iBOT training!")
+
     for epoch in range(start_epoch, args.epochs):
+        if wandb_logger:
+            wandb_logger.log_metrics({"epoch": epoch})
+        if (epoch+1) % args.sp_freq == 0:
+                lr_schedule = utils.cosine_scheduler(
+                    args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256.,  # linear scaling rule
+                    args.min_lr,
+                    (args.epochs//args.sp_freq), len(data_loader),
+                    warmup_epochs=args.warmup_epochs,
+                )
+                wd_schedule = utils.cosine_scheduler(
+                    args.weight_decay,
+                    args.weight_decay_end,
+                    (args.epochs//args.sp_freq), len(data_loader),
+                )
+                # momentum parameter is increased to 1. during training with a cosine schedule
+                momentum_schedule = utils.cosine_scheduler(args.momentum_teacher, 1,
+                                                        (args.epochs//args.sp_freq), len(data_loader))
+                
+                shrink_perturb(args, student, teacher)
+
         data_loader.sampler.set_epoch(epoch)
         data_loader.dataset.set_epoch(epoch)
 
         # ============ training one epoch of iBOT ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss,
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
-            epoch, fp16_scaler, args)
+            epoch, fp16_scaler, args, wandb_logger)
 
         # ============ writing logs ... ============
         save_dict = {
@@ -373,7 +415,7 @@ def train_ibot(args):
 
 def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
-                    fp16_scaler, args):
+                    fp16_scaler, args, wandb_logger=None):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
     
@@ -472,6 +514,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
     print("Averaged stats:", metric_logger)
     return_dict = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     return_dict.update({"nmi": nmi, "ari": ari, "fscore": fscore, "adjacc": adjacc})
+    if wandb_logger:
+        wandb_logger.log_metrics(return_dict)
     return return_dict
 
 
@@ -625,4 +669,14 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser('iBOT', parents=[get_args_parser()])
     args = parser.parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    train_ibot(args)
+    if args.wandb and utils.is_main_process():
+        wandb_logger = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            config=args,
+            save_code=True,
+        )
+    else:
+        wandb_logger = None
+    train_ibot(args, wandb_logger)
